@@ -295,8 +295,8 @@ fn main() {
     // Now we create another buffer that will store the unique data per instance.
     // For this example, we'll have the instances form a 10x10 grid that slowly gets larger.
     let instances = {
-        let rows = 10;
-        let cols = 10;
+        let rows = 100;
+        let cols = 100;
         // let n_instances = rows * cols;
         let mut data = Vec::new();
         for c in 0..cols {
@@ -323,6 +323,16 @@ fn main() {
         },
         false,
         instances,
+    )
+    .unwrap();
+    let instance_buffer_len_buffer = CpuAccessibleBuffer::from_data(
+        &memory_allocator,
+        BufferUsage {
+            storage_buffer: true,
+            ..BufferUsage::empty()
+        },
+        false,
+        instance_buffer.len() as u32,
     )
     .unwrap();
 
@@ -367,15 +377,32 @@ fn main() {
                     #version 450
                     // #extension GL_EXT_nonuniform_qualifier: require
                     layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-                    layout(set = 0, binding = 0) buffer Data0 {
-                        vec2 pos[];
-                    } data0;
-                    layout(set = 0, binding = 1) buffer Data1 {
-                        vec2 vel[];
-                    } data1;
+                    struct InstanceData {
+                        vec2 pos;
+                        vec2 vel;
+                    };
+                    layout(set = 0, binding = 0) buffer Data {
+                        InstanceData data[];
+                    } data;
+                    layout(set = 0, binding = 1) buffer Data1 { uint num_instances; } info;
                     void main() {
+                        memoryBarrierShared();
+                        barrier();
                         uint idx = gl_GlobalInvocationID.x;
-                        data0.pos[idx] *= data1.vel[idx];
+                        float factor = 0.001;
+                        data.data[idx].pos += data.data[idx].vel * factor; // TODO: multiply with delta time?
+                        memoryBarrierShared();
+                        barrier();
+                        vec2 vels = vec2(0.0, 0.0);
+                        vec2 my_pos = data.data[idx].pos;
+                        for (uint i = 0; i < info.num_instances; ++i) {
+                            vec2 dxy = data.data[i].pos - my_pos;
+                            float dist_squared = dxy.x * dxy.x + dxy.y * dxy.y;
+                            if (dist_squared > 0.001) {
+                                vels += dxy/dist_squared;
+                            }
+                        }
+                        data.data[idx].vel += vels * factor;
                     }
                 "
             }
@@ -602,12 +629,13 @@ fn main() {
                     // If you want to run the pipeline on multiple different buffers, you need to create multiple
                     // descriptor sets that each contain the buffer you want to run the shader on.
                     let layout = compute_pipeline.layout().set_layouts().get(0).unwrap();
+
                     let set = PersistentDescriptorSet::new(
                         &descriptor_set_allocator,
                         layout.clone(),
                         [
                             WriteDescriptorSet::buffer(0, instance_buffer.clone()),
-                            WriteDescriptorSet::buffer(1, instance_buffer.clone()),
+                            WriteDescriptorSet::buffer(1, instance_buffer_len_buffer.clone()),
                         ],
                     )
                     .unwrap();
@@ -672,8 +700,6 @@ fn main() {
                     // for n in 0..65536u32 {
                     //     assert_eq!(data_buffer_content[n as usize], n * 12);
                     // }
-
-                    println!("Success");
                 }
             }
             _ => (),
