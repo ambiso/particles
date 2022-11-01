@@ -566,7 +566,6 @@ fn main() {
                     // If you are familiar with graphics pipeline, the principle is the same except that compute
                     // pipelines are much simpler to create.
 
-                    let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
                     let descriptor_set_allocator =
                         StandardDescriptorSetAllocator::new(device.clone());
                     let command_buffer_allocator =
