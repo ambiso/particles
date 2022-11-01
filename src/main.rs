@@ -358,6 +358,33 @@ fn main() {
 
     let vs = vs::load(device.clone()).unwrap();
     let fs = fs::load(device.clone()).unwrap();
+    let compute_pipeline = {
+        mod cs {
+            vulkano_shaders::shader! {
+                ty: "compute",
+                src: "
+                    #version 450
+                    layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+                    layout(set = 0, binding = 0) buffer Data {
+                        uint data[];
+                    } data;
+                    void main() {
+                        uint idx = gl_GlobalInvocationID.x;
+                        data.data[idx] *= 12;
+                    }
+                "
+            }
+        }
+        let shader = cs::load(device.clone()).unwrap();
+        ComputePipeline::new(
+            device.clone(),
+            shader.entry_point("main").unwrap(),
+            &(),
+            None,
+            |_| {},
+        )
+        .unwrap()
+    };
 
     let render_pass = single_pass_renderpass!(
         device.clone(),
@@ -538,33 +565,6 @@ fn main() {
                     //
                     // If you are familiar with graphics pipeline, the principle is the same except that compute
                     // pipelines are much simpler to create.
-                    let pipeline = {
-                        mod cs {
-                            vulkano_shaders::shader! {
-                                ty: "compute",
-                                src: "
-                    #version 450
-                    layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-                    layout(set = 0, binding = 0) buffer Data {
-                        uint data[];
-                    } data;
-                    void main() {
-                        uint idx = gl_GlobalInvocationID.x;
-                        data.data[idx] *= 12;
-                    }
-                "
-                            }
-                        }
-                        let shader = cs::load(device.clone()).unwrap();
-                        ComputePipeline::new(
-                            device.clone(),
-                            shader.entry_point("main").unwrap(),
-                            &(),
-                            None,
-                            |_| {},
-                        )
-                        .unwrap()
-                    };
 
                     let memory_allocator = StandardMemoryAllocator::new_default(device.clone());
                     let descriptor_set_allocator =
@@ -597,7 +597,7 @@ fn main() {
                     //
                     // If you want to run the pipeline on multiple different buffers, you need to create multiple
                     // descriptor sets that each contain the buffer you want to run the shader on.
-                    let layout = pipeline.layout().set_layouts().get(0).unwrap();
+                    let layout = compute_pipeline.layout().set_layouts().get(0).unwrap();
                     let set = PersistentDescriptorSet::new(
                         &descriptor_set_allocator,
                         layout.clone(),
@@ -620,10 +620,10 @@ fn main() {
                         // `Arc`, this only clones the `Arc` and not the whole pipeline or set (which aren't
                         // cloneable anyway). In this example we would avoid cloning them since this is the last
                         // time we use them, but in a real code you would probably need to clone them.
-                        .bind_pipeline_compute(pipeline.clone())
+                        .bind_pipeline_compute(compute_pipeline.clone())
                         .bind_descriptor_sets(
                             PipelineBindPoint::Compute,
-                            pipeline.layout().clone(),
+                            compute_pipeline.layout().clone(),
                             0,
                             set,
                         )
