@@ -318,6 +318,7 @@ fn main() {
         &memory_allocator,
         BufferUsage {
             vertex_buffer: true,
+            storage_buffer: true,
             ..BufferUsage::empty()
         },
         false,
@@ -364,13 +365,17 @@ fn main() {
                 ty: "compute",
                 src: "
                     #version 450
+                    // #extension GL_EXT_nonuniform_qualifier: require
                     layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-                    layout(set = 0, binding = 0) buffer Data {
-                        uint data[];
-                    } data;
+                    layout(set = 0, binding = 0) buffer Data0 {
+                        vec2 pos[];
+                    } data0;
+                    layout(set = 0, binding = 1) buffer Data1 {
+                        vec2 vel[];
+                    } data1;
                     void main() {
                         uint idx = gl_GlobalInvocationID.x;
-                        data.data[idx] *= 12;
+                        data0.pos[idx] *= data1.vel[idx];
                     }
                 "
             }
@@ -572,21 +577,21 @@ fn main() {
                         StandardCommandBufferAllocator::new(device.clone(), Default::default());
 
                     // We start by creating the buffer that will store the data.
-                    let data_buffer = {
-                        // Iterator that produces the data.
-                        let data_iter = 0..65536u32;
-                        // Builds the buffer and fills it with this iterator.
-                        CpuAccessibleBuffer::from_iter(
-                            &memory_allocator,
-                            BufferUsage {
-                                storage_buffer: true,
-                                ..BufferUsage::empty()
-                            },
-                            false,
-                            data_iter,
-                        )
-                        .unwrap()
-                    };
+                    // let data_buffer = {
+                    //     // Iterator that produces the data.
+                    //     let data_iter = 0..65536u32;
+                    //     // Builds the buffer and fills it with this iterator.
+                    //     CpuAccessibleBuffer::from_iter(
+                    //         &memory_allocator,
+                    //         BufferUsage {
+                    //             storage_buffer: true,
+                    //             ..BufferUsage::empty()
+                    //         },
+                    //         false,
+                    //         data_iter,
+                    //     )
+                    //     .unwrap()
+                    // };
 
                     // In order to let the shader access the buffer, we need to build a *descriptor set* that
                     // contains the buffer.
@@ -600,7 +605,10 @@ fn main() {
                     let set = PersistentDescriptorSet::new(
                         &descriptor_set_allocator,
                         layout.clone(),
-                        [WriteDescriptorSet::buffer(0, data_buffer.clone())],
+                        [
+                            WriteDescriptorSet::buffer(0, instance_buffer.clone()),
+                            WriteDescriptorSet::buffer(1, instance_buffer.clone()),
+                        ],
                     )
                     .unwrap();
 
@@ -660,10 +668,10 @@ fn main() {
                     // Now that the GPU is done, the content of the buffer should have been modified. Let's
                     // check it out.
                     // The call to `read()` would return an error if the buffer was still in use by the GPU.
-                    let data_buffer_content = data_buffer.read().unwrap();
-                    for n in 0..65536u32 {
-                        assert_eq!(data_buffer_content[n as usize], n * 12);
-                    }
+                    // let data_buffer_content = data_buffer.read().unwrap();
+                    // for n in 0..65536u32 {
+                    //     assert_eq!(data_buffer_content[n as usize], n * 12);
+                    // }
 
                     println!("Success");
                 }
