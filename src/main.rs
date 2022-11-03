@@ -13,11 +13,12 @@
 // been more or more used for general-purpose operations as well. This is called "General-Purpose
 // GPU", or *GPGPU*. This is what this example demonstrates.
 
+use cgmath::Vector3;
 use vulkano::{
-    buffer::{BufferUsage, CpuAccessibleBuffer, TypedBufferAccess},
+    buffer::{BufferUsage, CpuAccessibleBuffer, DeviceLocalBuffer, TypedBufferAccess},
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        RenderPassBeginInfo, SubpassContents,
+        CopyBufferInfo, PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassContents,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet,
@@ -268,17 +269,28 @@ fn main() {
 
     // We now create a buffer that will store the shape of our triangle.
     // This triangle is identical to the one in the `triangle.rs` example.
-    let vertices = [
-        Vertex {
-            position: [-0.5, -0.25],
-        },
-        Vertex {
-            position: [0.0, 0.5],
-        },
-        Vertex {
-            position: [0.25, -0.1],
-        },
-    ];
+    let n = 50;
+    let size = 0.05;
+    let vertices = (0..n)
+        .flat_map(|x| {
+            let p = (x as f32 / n as f32) * 2. * std::f32::consts::PI;
+            let pn = ((x + 1) as f32 / n as f32) * 2. * std::f32::consts::PI;
+            vec![
+                Vertex {
+                    position: [size * p.cos(), size * p.sin()],
+                },
+                Vertex {
+                    position: [0.0, 0.0],
+                },
+                Vertex {
+                    position: [size * pn.cos(), size * pn.sin()],
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    dbg!(&vertices);
+
     let vertex_buffer = {
         CpuAccessibleBuffer::from_iter(
             &memory_allocator,
@@ -294,9 +306,10 @@ fn main() {
 
     // Now we create another buffer that will store the unique data per instance.
     // For this example, we'll have the instances form a 10x10 grid that slowly gets larger.
+
     let instances = {
-        let rows = 100;
-        let cols = 100;
+        let rows = 50;
+        let cols = 50;
         // let n_instances = rows * cols;
         let mut data = Vec::new();
         for c in 0..cols {
@@ -306,35 +319,77 @@ fn main() {
                 let x = half_cell_w + (c as f32 / cols as f32) * 2.0 - 1.0;
                 let y = half_cell_h + (r as f32 / rows as f32) * 2.0 - 1.0;
                 let position_offset = [x, y];
+
+                let r = (x * x + y * y).sqrt();
+
+                let tangent = 40. * r * Vector3::new(x, y, 0.).cross(Vector3::new(0., 0., 1.));
                 data.push(InstanceData {
                     pos: position_offset,
-                    vel: [0.0, 0.0],
+                    vel: [tangent.x, tangent.y],
                 });
             }
         }
         data
     };
-    let instance_buffer = CpuAccessibleBuffer::from_iter(
-        &memory_allocator,
-        BufferUsage {
-            vertex_buffer: true,
-            storage_buffer: true,
-            ..BufferUsage::empty()
-        },
-        false,
-        instances,
-    )
-    .unwrap();
-    let instance_buffer_len_buffer = CpuAccessibleBuffer::from_data(
-        &memory_allocator,
-        BufferUsage {
-            storage_buffer: true,
-            ..BufferUsage::empty()
-        },
-        false,
-        instance_buffer.len() as u32,
-    )
-    .unwrap();
+
+    let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone());
+    let command_buffer_allocator =
+        StandardCommandBufferAllocator::new(device.clone(), Default::default());
+
+    let instance_buffer = {
+        let temporary_accessible_buffer = CpuAccessibleBuffer::from_iter(
+            &memory_allocator,
+            BufferUsage {
+                vertex_buffer: true,
+                storage_buffer: true,
+                transfer_src: true,
+                ..BufferUsage::empty()
+            },
+            false,
+            instances,
+        )
+        .unwrap();
+
+        // Create a buffer array on the GPU with enough space for `PARTICLE_COUNT` number of `Vertex`.
+        let instance_buffer_device_local = DeviceLocalBuffer::<[InstanceData]>::array(
+            &memory_allocator,
+            temporary_accessible_buffer.len() as vulkano::DeviceSize,
+            BufferUsage {
+                storage_buffer: true,
+                ..BufferUsage::empty()
+            } | BufferUsage {
+                transfer_dst: true,
+                vertex_buffer: true,
+                ..BufferUsage::empty()
+            }, // Specify use as a storage buffer, vertex buffer, and transfer destination.
+            device.active_queue_family_indices().iter().copied(),
+        )
+        .unwrap();
+
+        // Create one-time command to copy between the buffers.
+        let mut cbb = AutoCommandBufferBuilder::primary(
+            &command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+        cbb.copy_buffer(CopyBufferInfo::buffers(
+            temporary_accessible_buffer,
+            instance_buffer_device_local.clone(),
+        ))
+        .unwrap();
+        let cb = cbb.build().unwrap();
+
+        // Execute copy and wait for copy to complete before proceeding.
+        cb.execute(queue.clone())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None /* timeout */)
+            .unwrap();
+
+        instance_buffer_device_local
+    };
 
     mod vs {
         vulkano_shaders::shader! {
@@ -361,7 +416,7 @@ fn main() {
                 #version 450
                 layout(location = 0) out vec4 f_color;
                 void main() {
-                    f_color = vec4(1.0, 0.0, 0.0, 1.0);
+                    f_color = vec4(0.0, 1.0, 0.0, 1.0);
                 }
             "
         }
@@ -369,44 +424,51 @@ fn main() {
 
     let vs = vs::load(device.clone()).unwrap();
     let fs = fs::load(device.clone()).unwrap();
-    let compute_pipeline = {
-        mod cs {
-            vulkano_shaders::shader! {
-                ty: "compute",
-                src: "
-                    #version 450
-                    // #extension GL_EXT_nonuniform_qualifier: require
-                    layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-                    struct InstanceData {
-                        vec2 pos;
-                        vec2 vel;
-                    };
-                    layout(set = 0, binding = 0) buffer Data {
-                        InstanceData data[];
-                    } data;
-                    layout(set = 0, binding = 1) buffer Data1 { uint num_instances; } info;
-                    void main() {
-                        memoryBarrierShared();
-                        barrier();
-                        uint idx = gl_GlobalInvocationID.x;
-                        float factor = 0.001;
-                        data.data[idx].pos += data.data[idx].vel * factor; // TODO: multiply with delta time?
-                        memoryBarrierShared();
-                        barrier();
-                        vec2 vels = vec2(0.0, 0.0);
-                        vec2 my_pos = data.data[idx].pos;
-                        for (uint i = 0; i < info.num_instances; ++i) {
-                            vec2 dxy = data.data[i].pos - my_pos;
-                            float dist_squared = dxy.x * dxy.x + dxy.y * dxy.y;
-                            if (dist_squared > 0.001) {
-                                vels += dxy/dist_squared;
-                            }
+    mod cs {
+        vulkano_shaders::shader! {
+            ty: "compute",
+            src: "
+                #version 450
+                struct InstanceData {
+                    vec2 pos;
+                    vec2 vel;
+                };
+                layout (push_constant) uniform PushConstants {
+                    uint num_instances;
+                } info;
+                layout(set = 0, binding = 0) buffer Data {
+                    InstanceData data[];
+                } data;
+
+                layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+                void main() {
+                    memoryBarrierShared();
+                    barrier();
+                    uint idx = gl_GlobalInvocationID.x;
+                    float factor = 0.0001;
+                    data.data[idx].pos += data.data[idx].vel * factor; // TODO: multiply with delta time?
+                    memoryBarrierShared();
+                    barrier();
+                    vec2 vels = vec2(0.0, 0.0);
+                    vec2 my_pos = data.data[idx].pos;
+                    for (uint i = 0; i < info.num_instances; ++i) {
+                        vec2 dxy = data.data[i].pos - my_pos;
+                        float dist_squared = dxy.x * dxy.x + dxy.y * dxy.y;
+                        if (dist_squared > 0.001) {
+                            vels += dxy/dist_squared;
                         }
-                        data.data[idx].vel += vels * factor;
                     }
-                "
-            }
+                    data.data[idx].vel += vels * factor;
+                }
+            ",
+            types_meta: {
+                use bytemuck::{Pod, Zeroable};
+
+                #[derive(Clone, Copy, Zeroable, Pod)]
+            },
         }
+    }
+    let compute_pipeline = {
         let shader = cs::load(device.clone()).unwrap();
         ComputePipeline::new(
             device.clone(),
@@ -529,7 +591,7 @@ fn main() {
                 builder
                     .begin_render_pass(
                         RenderPassBeginInfo {
-                            clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
+                            clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
                             ..RenderPassBeginInfo::framebuffer(
                                 framebuffers[image_index as usize].clone(),
                             )
@@ -579,47 +641,6 @@ fn main() {
                 }
 
                 {
-                    // Now let's get to the actual example.
-                    //
-                    // What we are going to do is very basic: we are going to fill a buffer with 64k integers
-                    // and ask the GPU to multiply each of them by 12.
-                    //
-                    // GPUs are very good at parallel computations (SIMD-like operations), and thus will do this
-                    // much more quickly than a CPU would do. While a CPU would typically multiply them one by one
-                    // or four by four, a GPU will do it by groups of 32 or 64.
-                    //
-                    // Note however that in a real-life situation for such a simple operation the cost of
-                    // accessing memory usually outweighs the benefits of a faster calculation. Since both the CPU
-                    // and the GPU will need to access data, there is no other choice but to transfer the data
-                    // through the slow PCI express bus.
-
-                    // We need to create the compute pipeline that describes our operation.
-                    //
-                    // If you are familiar with graphics pipeline, the principle is the same except that compute
-                    // pipelines are much simpler to create.
-
-                    let descriptor_set_allocator =
-                        StandardDescriptorSetAllocator::new(device.clone());
-                    let command_buffer_allocator =
-                        StandardCommandBufferAllocator::new(device.clone(), Default::default());
-
-                    // We start by creating the buffer that will store the data.
-                    // let data_buffer = {
-                    //     // Iterator that produces the data.
-                    //     let data_iter = 0..65536u32;
-                    //     // Builds the buffer and fills it with this iterator.
-                    //     CpuAccessibleBuffer::from_iter(
-                    //         &memory_allocator,
-                    //         BufferUsage {
-                    //             storage_buffer: true,
-                    //             ..BufferUsage::empty()
-                    //         },
-                    //         false,
-                    //         data_iter,
-                    //     )
-                    //     .unwrap()
-                    // };
-
                     // In order to let the shader access the buffer, we need to build a *descriptor set* that
                     // contains the buffer.
                     //
@@ -630,12 +651,17 @@ fn main() {
                     // descriptor sets that each contain the buffer you want to run the shader on.
                     let layout = compute_pipeline.layout().set_layouts().get(0).unwrap();
 
+                    // Create push contants to be passed to compute shader.
+                    let push_constants = cs::ty::PushConstants {
+                        num_instances: instance_buffer.len() as u32,
+                    };
+
                     let set = PersistentDescriptorSet::new(
                         &descriptor_set_allocator,
                         layout.clone(),
                         [
                             WriteDescriptorSet::buffer(0, instance_buffer.clone()),
-                            WriteDescriptorSet::buffer(1, instance_buffer_len_buffer.clone()),
+                            // WriteDescriptorSet::buffer(1, instance_buffer_len_buffer.clone()),
                         ],
                     )
                     .unwrap();
@@ -655,6 +681,7 @@ fn main() {
                         // `Arc`, this only clones the `Arc` and not the whole pipeline or set (which aren't
                         // cloneable anyway). In this example we would avoid cloning them since this is the last
                         // time we use them, but in a real code you would probably need to clone them.
+                        .push_constants(compute_pipeline.layout().clone(), 0, push_constants)
                         .bind_pipeline_compute(compute_pipeline.clone())
                         .bind_descriptor_sets(
                             PipelineBindPoint::Compute,
